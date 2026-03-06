@@ -1,0 +1,20 @@
+idf_component_register(
+    SRCS
+        frontend.c
+        frontend_util.c
+        window.c
+        window_util.c
+        filterbank.c
+        filterbank_util.c
+        fft.cc
+        fft_util.cc
+        kiss_fft_int16.cc
+        noise_reduction.c
+        noise_reduction_util.c
+        pcan_gain_control.c
+        pcan_gain_control_util.c
+        log_scale.c
+        log_scale_util.c
+        log_lut.c
+    INCLUDE_DIRS "include" "kissfft"
+)

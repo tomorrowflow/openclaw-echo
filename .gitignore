@@ -1,0 +1,4 @@
+vendor/flatsphere/main/include/secrets.h
+vendor/flatsphere/build/
+vendor/flatsphere/managed_components/
+vendor/flatsphere/sdkconfig.old

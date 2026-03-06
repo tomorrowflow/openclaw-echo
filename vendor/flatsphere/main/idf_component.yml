@@ -1,0 +1,11 @@
+## IDF Component Manager Manifest File
+dependencies:
+  idf:
+    version: ">=5.5.1"
+  lvgl/lvgl: ^9.4.0
+  jmattsson/picotts:
+    version: "==1.*"
+  usb_host_msc: "^1.1.4"
+  espressif/esp_codec_dev: "^1.4.0"
+  espressif/esp_websocket_client: "^1.0.0"
+  espressif/esp-tflite-micro: "^1.0.0"
