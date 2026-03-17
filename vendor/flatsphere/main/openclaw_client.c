@@ -314,7 +314,11 @@ static void handle_message(const char *data, int len)
                     const char *rid = cJSON_GetStringValue(cJSON_GetObjectItem(edata, "requestId"));
                     if (rid) ESP_LOGE(TAG, "Pairing requestId: %s (approve in OpenClaw UI or CLI)", rid);
                 }
-                set_state(OPENCLAW_STATE_ERROR);
+                if (code && strcmp(code, "NOT_PAIRED") == 0) {
+                    set_state(OPENCLAW_STATE_NOT_PAIRED);
+                } else {
+                    set_state(OPENCLAW_STATE_ERROR);
+                }
             } else if (s_oc.state == OPENCLAW_STATE_CHAT_SENDING ||
                        s_oc.state == OPENCLAW_STATE_CHAT_THINKING) {
                 /* Chat request rejected by server */
@@ -618,4 +622,9 @@ uint32_t openclaw_get_thinking_time_ms(void)
 {
     if (s_oc.chat_start_time == 0) return 0;
     return (uint32_t)((esp_timer_get_time() - s_oc.chat_start_time) / 1000);
+}
+
+const char *openclaw_get_device_id(void)
+{
+    return s_oc.device_id;
 }

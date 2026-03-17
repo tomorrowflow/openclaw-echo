@@ -411,11 +411,19 @@ static void tts_play_callback(const int16_t *samples, size_t bytes)
 }
 
 /* ── OpenClaw state callback ── */
+static volatile bool oc_needs_pairing = false;
+
 static void oc_state_callback(openclaw_state_t state)
 {
     ESP_LOGI(TAG, "OpenClaw state: %d", state);
     if (state == OPENCLAW_STATE_CONNECTED) {
+        oc_needs_pairing = false;
         xEventGroupSetBits(app_events, EVT_OC_CONNECTED);
+    } else if (state == OPENCLAW_STATE_NOT_PAIRED) {
+        oc_needs_pairing = true;
+        const char *dev_id = openclaw_get_device_id();
+        ESP_LOGW(TAG, "Device NOT PAIRED — approve in OpenClaw: openclaw devices approve");
+        ESP_LOGW(TAG, "Device ID: %s", dev_id);
     }
 }
 
@@ -619,19 +627,38 @@ extern "C" void app_main(void)
     hal.display()->lvgl_timer_handler();
     openclaw_connect();
 
-    /* Wait for OpenClaw connection, while pumping MicroLink state machine */
+    /* Wait for OpenClaw connection, while pumping MicroLink state machine.
+     * If NOT_PAIRED, show pairing instructions and wait longer for user to approve. */
     {
         TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(30000);
         bool oc_connected = false;
+        bool pairing_shown = false;
         while (xTaskGetTickCount() < deadline) {
             if (ml_handle) microlink_update(ml_handle);
             EventBits_t bits = xEventGroupWaitBits(app_events, EVT_OC_CONNECTED,
                                                     pdTRUE, pdFALSE, pdMS_TO_TICKS(100));
             if (bits & EVT_OC_CONNECTED) { oc_connected = true; break; }
+
+            /* Show pairing prompt when NOT_PAIRED is detected */
+            if (oc_needs_pairing && !pairing_shown) {
+                pairing_shown = true;
+                /* Show short device ID prefix on display for identification */
+                const char *dev_id = openclaw_get_device_id();
+                char pair_msg[80];
+                snprintf(pair_msg, sizeof(pair_msg), "Pair device in\nOpenClaw UI\n%.8s...", dev_id);
+                echo_ui_set_status(pair_msg);
+                /* Extend deadline to give user time to approve (2 min) */
+                deadline = xTaskGetTickCount() + pdMS_TO_TICKS(120000);
+            }
+
             hal.display()->lvgl_timer_handler();
         }
         if (!oc_connected) {
-            echo_ui_set_error("OC not reachable");
+            if (pairing_shown) {
+                echo_ui_set_error("Pairing timeout");
+            } else {
+                echo_ui_set_error("OC not reachable");
+            }
             /* Continue anyway — might connect later via auto-reconnect */
         }
     }

@@ -23,6 +23,7 @@ typedef enum {
     OPENCLAW_STATE_CHAT_THINKING,
     OPENCLAW_STATE_CHAT_STREAMING,
     OPENCLAW_STATE_ERROR,
+    OPENCLAW_STATE_NOT_PAIRED,
 } openclaw_state_t;
 
 typedef struct {
@@ -46,11 +47,17 @@ openclaw_state_t openclaw_get_state(void);
 /* Send a text chat message and receive streaming response via callback */
 esp_err_t openclaw_chat_send(const char *message, openclaw_chat_cb_t response_cb);
 
+/* Cancel a pending chat (clears callback, resets state to CONNECTED) */
+void openclaw_chat_cancel(void);
+
 /* Get the accumulated full response text (valid after final callback) */
 const char *openclaw_get_last_response(void);
 
 /* Get elapsed time since chat was sent (ms) */
 uint32_t openclaw_get_thinking_time_ms(void);
+
+/* Get device ID (64-char hex, or empty if no device key). For pairing UI. */
+const char *openclaw_get_device_id(void);
 
 #ifdef __cplusplus
 }
