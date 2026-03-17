@@ -1,0 +1,10 @@
+# Docker trainer repo (cloned by setup.sh)
+microWakeWord-Trainer-Nvidia-Docker/
+
+# Trained models (binary, copy to assets via swap_model.sh)
+models/*.tflite
+
+# Training intermediates
+*.h5
+*.pb
+__pycache__/
