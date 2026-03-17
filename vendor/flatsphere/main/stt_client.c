@@ -100,7 +100,7 @@ esp_err_t stt_transcribe(const int16_t *pcm, size_t num_samples,
 
     /* Prepare URL — whisper-asr-webservice uses /asr with multipart form upload */
     char url[160];
-    snprintf(url, sizeof(url), "http://%s:%d/asr?task=transcribe&output=json&encode=false", s_host, s_port);
+    snprintf(url, sizeof(url), "http://%s:%d/asr?task=transcribe&language=en&output=json&encode=false", s_host, s_port);
 
     /* Build multipart/form-data body in PSRAM.
      * Format:

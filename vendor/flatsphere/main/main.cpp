@@ -37,9 +37,11 @@ extern "C" {
 #include "openclaw_client.h"
 }
 
+#include "echo_ui.h"
 #include "micro_wake.h"
 #include "microlink.h"
 #include "lwip/dns.h"
+#include "esp_sntp.h"
 
 #include "secrets.h"
 
@@ -60,20 +62,12 @@ static const char* TAG = "echo";
 #define STT_SAMPLE_RATE  16000
 
 /* ── Audio recording config ── */
-#define MAX_RECORD_SECONDS  10
+#define MAX_RECORD_SECONDS  30
 #define RECORD_BUF_SAMPLES  (STT_SAMPLE_RATE * MAX_RECORD_SECONDS)  /* 16kHz mono */
-#define SILENCE_TIMEOUT_MS  1500    /* Stop recording after 1.5s silence */
+#define SILENCE_TIMEOUT_MS       1500    /* Stop recording after 1.5s silence */
+#define SILENCE_TIMEOUT_CONV_MS  2500    /* Longer timeout when continuing conversation */
 
-/* ── App state ── */
-typedef enum {
-    STATE_INIT = 0,
-    STATE_IDLE,
-    STATE_RECORDING,
-    STATE_TRANSCRIBING,
-    STATE_CHATTING,
-    STATE_SPEAKING,
-    STATE_ERROR,
-} app_state_t;
+/* app_state_t defined in echo_ui.h */
 
 using namespace HAL;
 using namespace SETTINGS;
@@ -91,10 +85,10 @@ static int16_t *record_buf = nullptr;       /* 16kHz mono in PSRAM */
 static size_t record_samples = 0;
 static microlink_t *ml_handle = nullptr;    /* Tailscale VPN handle */
 
-/* UI labels */
-static lv_obj_t *lbl_state = nullptr;
-static lv_obj_t *lbl_info = nullptr;
-static lv_obj_t *lbl_response = nullptr;
+/* Transcript storage for chat retry */
+static char last_transcript[512] = "";
+static bool continue_conversation = false;  /* After TTS, loop back to recording */
+static volatile bool tts_cancel = false;    /* Touch during playback cancels TTS */
 
 /* Event bits for cross-task signaling */
 static EventGroupHandle_t app_events = nullptr;
@@ -111,8 +105,60 @@ static bool oc_response_ready = false;
 /* ── Forward declarations ── */
 static esp_err_t setup_audio();
 static void setup_wifi();
-static void setup_ui();
-static void update_ui_state(const char *state_text, uint32_t color);
+
+/* ── Boot chime: two-tone ascending (C5→E5), 150ms each ── */
+#define CHIME_TONE_MS      150
+#define CHIME_GAP_MS       30
+#define CHIME_TONE_SAMPLES (SAMPLE_RATE * CHIME_TONE_MS / 1000)
+#define CHIME_GAP_SAMPLES  (SAMPLE_RATE * CHIME_GAP_MS / 1000)
+#define CHIME_TOTAL_SAMPLES (CHIME_TONE_SAMPLES * 2 + CHIME_GAP_SAMPLES)
+
+static void play_boot_chime(esp_codec_dev_handle_t out_dev)
+{
+    const size_t stereo_samples = CHIME_TOTAL_SAMPLES * 2;
+    int16_t *buf = (int16_t *)heap_caps_malloc(stereo_samples * sizeof(int16_t),
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) return;
+
+    const float freq1 = 523.25f;  /* C5 */
+    const float freq2 = 659.25f;  /* E5 */
+    const float amplitude = 8000.0f;
+    size_t idx = 0;
+
+    /* Tone 1 with fade-in/out envelope */
+    for (size_t i = 0; i < CHIME_TONE_SAMPLES; i++) {
+        float env = 1.0f;
+        if (i < 200) env = (float)i / 200.0f;
+        if (i > CHIME_TONE_SAMPLES - 400) env = (float)(CHIME_TONE_SAMPLES - i) / 400.0f;
+        float sample = amplitude * env * sinf(2.0f * M_PI * freq1 * i / SAMPLE_RATE);
+        int16_t s = (int16_t)sample;
+        buf[idx++] = s;  /* L */
+        buf[idx++] = s;  /* R */
+    }
+
+    /* Gap (silence) */
+    for (size_t i = 0; i < CHIME_GAP_SAMPLES; i++) {
+        buf[idx++] = 0;
+        buf[idx++] = 0;
+    }
+
+    /* Tone 2 with envelope */
+    for (size_t i = 0; i < CHIME_TONE_SAMPLES; i++) {
+        float env = 1.0f;
+        if (i < 200) env = (float)i / 200.0f;
+        if (i > CHIME_TONE_SAMPLES - 400) env = (float)(CHIME_TONE_SAMPLES - i) / 400.0f;
+        float sample = amplitude * env * sinf(2.0f * M_PI * freq2 * i / SAMPLE_RATE);
+        int16_t s = (int16_t)sample;
+        buf[idx++] = s;
+        buf[idx++] = s;
+    }
+
+    gpio_set_level((gpio_num_t)PA_EN_IO, 1);
+    esp_codec_dev_write(out_dev, buf, stereo_samples * sizeof(int16_t));
+    gpio_set_level((gpio_num_t)PA_EN_IO, 0);
+
+    heap_caps_free(buf);
+}
 
 /* ── Audio setup (from loopback test) ── */
 static esp_err_t setup_audio()
@@ -326,6 +372,24 @@ static void setup_wifi()
         esp_netif_ip_info_t ip_info;
         esp_netif_get_ip_info(netif, &ip_info);
         ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&ip_info.ip));
+
+        /* Sync system clock via SNTP (needed for device auth signatures) */
+        esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+        esp_sntp_setservername(0, "time.google.com");
+        esp_sntp_setservername(1, "pool.ntp.org");
+        esp_sntp_init();
+        int ntp_retries = 0;
+        while (esp_sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && ntp_retries < 50) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            ntp_retries++;
+        }
+        if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+            time_t now;
+            time(&now);
+            ESP_LOGI(TAG, "NTP synced: %lld", (long long)now);
+        } else {
+            ESP_LOGW(TAG, "NTP sync timeout — device auth may fail");
+        }
     } else {
         ESP_LOGW(TAG, "WiFi connected but no IP yet — DHCP may still be pending");
     }
@@ -334,6 +398,15 @@ static void setup_wifi()
 /* ── TTS playback callback ── */
 static void tts_play_callback(const int16_t *samples, size_t bytes)
 {
+    if (tts_cancel) return;  /* Skip playback when cancelled by touch */
+
+    /* Poll touch during playback — cancel TTS immediately on touch */
+    if (hal.display()->is_touched()) {
+        ESP_LOGI(TAG, "TTS cancelled by touch");
+        tts_cancel = true;
+        return;
+    }
+
     esp_codec_dev_write(output_dev, (void *)samples, bytes);
 }
 
@@ -358,42 +431,6 @@ static void oc_chat_callback(const char *text, bool is_final)
     }
 }
 
-/* ── UI setup ── */
-static void setup_ui()
-{
-    lv_obj_t* scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), LV_PART_MAIN);
-
-    lbl_state = lv_label_create(scr);
-    lv_obj_set_style_text_color(lbl_state, lv_color_hex(0x00FF00), LV_PART_MAIN);
-    lv_obj_set_style_text_font(lbl_state, &lv_font_montserrat_20, LV_PART_MAIN);
-    lv_obj_align(lbl_state, LV_ALIGN_TOP_MID, 0, 30);
-    lv_label_set_text(lbl_state, "Initializing...");
-
-    lbl_info = lv_label_create(scr);
-    lv_obj_set_style_text_color(lbl_info, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-    lv_obj_set_style_text_font(lbl_info, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_set_width(lbl_info, 300);
-    lv_label_set_long_mode(lbl_info, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(lbl_info, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(lbl_info, LV_ALIGN_CENTER, 0, 0);
-    lv_label_set_text(lbl_info, "");
-
-    lbl_response = lv_label_create(scr);
-    lv_obj_set_style_text_color(lbl_response, lv_color_hex(0x888888), LV_PART_MAIN);
-    lv_obj_set_style_text_font(lbl_response, &lv_font_montserrat_12, LV_PART_MAIN);
-    lv_obj_set_width(lbl_response, 300);
-    lv_label_set_long_mode(lbl_response, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(lbl_response, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(lbl_response, LV_ALIGN_BOTTOM_MID, 0, -20);
-    lv_label_set_text(lbl_response, "Say \"Hey Jarvis\" or press BOOT");
-}
-
-static void update_ui_state(const char *state_text, uint32_t color)
-{
-    lv_obj_set_style_text_color(lbl_state, lv_color_hex(color), LV_PART_MAIN);
-    lv_label_set_text(lbl_state, state_text);
-}
 
 /* ── Wake word callback (called from Core 0) ── */
 static void wake_word_callback(void)
@@ -414,14 +451,13 @@ extern "C" void app_main(void)
     app_events = xEventGroupCreate();
 
     /* Setup UI */
-    setup_ui();
+    echo_ui_init();
     hal.display()->lvgl_timer_handler();
 
     /* Setup audio */
     esp_err_t ret = setup_audio();
     if (ret != ESP_OK) {
-        update_ui_state("AUDIO FAILED", 0xFF0000);
-        lv_label_set_text(lbl_info, esp_err_to_name(ret));
+        echo_ui_set_error("AUDIO FAILED");
         while (1) {
             hal.display()->lvgl_timer_handler();
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -432,7 +468,7 @@ extern "C" void app_main(void)
     record_buf = (int16_t *)heap_caps_malloc(RECORD_BUF_SAMPLES * sizeof(int16_t),
                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!record_buf) {
-        update_ui_state("PSRAM OOM", 0xFF0000);
+        echo_ui_set_error("PSRAM OOM");
         while (1) {
             hal.display()->lvgl_timer_handler();
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -440,13 +476,12 @@ extern "C" void app_main(void)
     }
 
     /* Setup WiFi */
-    update_ui_state("Connecting WiFi...", 0xFFAA00);
+    echo_ui_set_status("Connecting WiFi...");
     hal.display()->lvgl_timer_handler();
     setup_wifi();
 
     if (!hal.wifi()->is_connected()) {
-        update_ui_state("WiFi Failed", 0xFF0000);
-        lv_label_set_text(lbl_info, "Check SSID/password in secrets.h");
+        echo_ui_set_error("WiFi Failed");
         while (1) {
             hal.display()->lvgl_timer_handler();
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -510,7 +545,7 @@ extern "C" void app_main(void)
                      microlink_state_to_str(old_s), microlink_state_to_str(new_s));
         };
 
-        update_ui_state("Tailscale...", 0xFFAA00);
+        echo_ui_set_status("Tailscale...");
         hal.display()->lvgl_timer_handler();
 
         /* Reduce MicroLink verbosity — keep WARN+ for routine ops,
@@ -554,7 +589,7 @@ extern "C" void app_main(void)
 
     /* Wait for VPN tunnel before connecting OpenClaw (host is on Tailscale network) */
     if (ml_handle) {
-        update_ui_state("Waiting VPN...", 0xFFAA00);
+        echo_ui_set_status("Waiting VPN...");
         hal.display()->lvgl_timer_handler();
 
         TickType_t vpn_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(60000);
@@ -580,7 +615,7 @@ extern "C" void app_main(void)
     }
 
     /* Connect to OpenClaw */
-    update_ui_state("Connecting OC...", 0xFFAA00);
+    echo_ui_set_status("Connecting OC...");
     hal.display()->lvgl_timer_handler();
     openclaw_connect();
 
@@ -596,14 +631,13 @@ extern "C" void app_main(void)
             hal.display()->lvgl_timer_handler();
         }
         if (!oc_connected) {
-            update_ui_state("OC Timeout", 0xFF4400);
-            lv_label_set_text(lbl_info, "OpenClaw not reachable");
+            echo_ui_set_error("OC not reachable");
             /* Continue anyway — might connect later via auto-reconnect */
         }
     }
 
     /* Start wake word detection on Core 0 */
-    update_ui_state("Loading wake...", 0xFFAA00);
+    echo_ui_set_status("Loading wake...");
     hal.display()->lvgl_timer_handler();
 
     micro_wake_set_callback(wake_word_callback);
@@ -612,12 +646,23 @@ extern "C" void app_main(void)
         ESP_LOGW(TAG, "Wake word init failed: %s — BOOT button only", esp_err_to_name(ret));
     }
 
-    /* Ready! */
+    /* Boot complete — show "OK", play chime, then go dark */
+    app_state = STATE_READY;
+    echo_ui_set_state(STATE_READY);
+    hal.display()->lvgl_timer_handler();
+
+    play_boot_chime(output_dev);
+
+    /* Hold "OK" on screen for 1.5s total (chime takes ~330ms) */
+    vTaskDelay(pdMS_TO_TICKS(1200));
+
+    /* Fade backlight to 0 and enter dark idle */
+    for (int bl = 100; bl >= 0; bl -= 5) {
+        hal.display()->set_backlight((uint8_t)bl);
+        vTaskDelay(pdMS_TO_TICKS(25));  /* ~500ms total fade */
+    }
     app_state = STATE_IDLE;
-    update_ui_state("Ready", 0x00FF00);
-    lv_label_set_text(lbl_response, "Say \"Hey Jarvis\" or press BOOT");
-    /* Don't flush here — micro_wake just started on Core 0 and SPI
-     * queue conflicts. The app_task flushes on its first iteration. */
+    echo_ui_set_state(STATE_IDLE);
 
     /* Launch app task on Core 1 — use PSRAM for stack (internal RAM exhausted) */
     BaseType_t task_ret = xTaskCreatePinnedToCoreWithCaps(
@@ -647,12 +692,14 @@ static void app_task(void *arg)
     gpio_config(&btn_cfg);
 
     bool btn_prev = true;
+    bool touch_prev = false;
 
     /* Let micro_wake task settle before first LVGL flush — avoids SPI queue race */
     vTaskDelay(pdMS_TO_TICKS(100));
 
     /* ── Main loop ── */
     while (1) {
+        echo_ui_tick();
         hal.display()->lvgl_timer_handler();
 
         /* Check BOOT button (active low) */
@@ -663,6 +710,11 @@ static void app_task(void *arg)
         if (btn_pressed) {
             vTaskDelay(pdMS_TO_TICKS(50)); /* debounce */
         }
+
+        /* Check touch (edge-triggered: detect touch-down) */
+        bool touch_now = hal.display()->is_touched();
+        bool touch_pressed = (!touch_prev && touch_now);
+        touch_prev = touch_now;
 
         /* Check for wake word event */
         EventBits_t wake_bits = xEventGroupGetBits(app_events);
@@ -675,14 +727,25 @@ static void app_task(void *arg)
         switch (app_state) {
 
         case STATE_IDLE:
-            if (btn_pressed || wake_triggered) {
+            if (btn_pressed || wake_triggered || continue_conversation || touch_pressed) {
+                bool is_continuation = continue_conversation;
+                continue_conversation = false;
+
                 if (wake_triggered) {
                     ESP_LOGI(TAG, "Wake word triggered! Starting recording...");
+                } else if (touch_pressed) {
+                    ESP_LOGI(TAG, "Touch triggered! Starting recording...");
+                } else if (is_continuation) {
+                    ESP_LOGI(TAG, "Continuing conversation, listening for response...");
                 }
+
+                uint32_t silence_ms = is_continuation ? SILENCE_TIMEOUT_CONV_MS : SILENCE_TIMEOUT_MS;
+
+                /* Wake the display */
+                hal.display()->set_backlight(100);
+
                 app_state = STATE_RECORDING;
-                update_ui_state("Listening...", 0xFF0000);
-                lv_label_set_text(lbl_info, "");
-                lv_label_set_text(lbl_response, "");
+                echo_ui_set_state(STATE_RECORDING);
                 hal.display()->lvgl_timer_handler();
 
                 /* Tell wake task to start copying audio to record buffer */
@@ -691,16 +754,26 @@ static void app_task(void *arg)
                 /* Wait for silence (VAD-based) or button cancel */
                 uint32_t silence_start = 0;
                 bool got_voice = false;
+                bool touch_cancelled = false;
                 TickType_t rec_start_tick = xTaskGetTickCount();
 
                 while (app_state == STATE_RECORDING) {
-                    /* Check for cancel (button press during recording) */
+                    /* Check for cancel (button or touch during recording) */
                     bool b = gpio_get_level((gpio_num_t)BOOT_BTN_IO);
                     if (!b && btn_prev) {
                         ESP_LOGI(TAG, "Recording stopped by button");
                         break;
                     }
                     btn_prev = b;
+
+                    bool t = hal.display()->is_touched();
+                    if (t && !touch_prev) {
+                        ESP_LOGI(TAG, "Recording cancelled by touch");
+                        touch_prev = t;
+                        touch_cancelled = true;
+                        break;
+                    }
+                    touch_prev = t;
 
                     /* VAD-based silence detection */
                     bool vad = micro_wake_vad_active();
@@ -710,8 +783,14 @@ static void app_task(void *arg)
                     } else if (got_voice) {
                         if (silence_start == 0) {
                             silence_start = xTaskGetTickCount();
-                        } else if ((xTaskGetTickCount() - silence_start) * portTICK_PERIOD_MS > SILENCE_TIMEOUT_MS) {
+                        } else if ((xTaskGetTickCount() - silence_start) * portTICK_PERIOD_MS > silence_ms) {
                             ESP_LOGI(TAG, "VAD silence detected, stopping recording");
+                            break;
+                        }
+                    } else if (is_continuation) {
+                        /* In conversation mode, if no voice at all after 2.5s, give up */
+                        if ((xTaskGetTickCount() - rec_start_tick) * portTICK_PERIOD_MS > SILENCE_TIMEOUT_CONV_MS) {
+                            ESP_LOGI(TAG, "No follow-up speech, ending conversation");
                             break;
                         }
                     }
@@ -733,6 +812,13 @@ static void app_task(void *arg)
                 /* Stop recording and get sample count */
                 record_samples = micro_wake_stop_recording();
 
+                /* Touch cancel → discard recording, return to idle */
+                if (touch_cancelled) {
+                    app_state = STATE_IDLE;
+                    echo_ui_set_state(STATE_IDLE);
+                    break;
+                }
+
                 ESP_LOGI(TAG, "Recorded %u samples (%.1fs at %dHz)",
                          (unsigned)record_samples,
                          (float)record_samples / STT_SAMPLE_RATE,
@@ -741,8 +827,7 @@ static void app_task(void *arg)
                 if (record_samples < STT_SAMPLE_RATE / 4) {
                     ESP_LOGW(TAG, "Recording too short, ignoring");
                     app_state = STATE_IDLE;
-                    update_ui_state("Ready", 0x00FF00);
-                    lv_label_set_text(lbl_response, "Say \"Hey Jarvis\" or press BOOT");
+                    echo_ui_set_state(STATE_IDLE);
                 } else {
                     app_state = STATE_TRANSCRIBING;
                 }
@@ -750,45 +835,48 @@ static void app_task(void *arg)
             break;
 
         case STATE_TRANSCRIBING: {
-            update_ui_state("Transcribing...", 0xFFAA00);
+            echo_ui_set_state(STATE_TRANSCRIBING);
             hal.display()->lvgl_timer_handler();
 
             char transcript[512] = "";
             esp_err_t err = stt_transcribe(record_buf, record_samples,
                                            STT_SAMPLE_RATE, transcript, sizeof(transcript));
 
+            /* Check for touch cancel after STT completes */
+            if (hal.display()->is_touched()) {
+                ESP_LOGI(TAG, "Transcription cancelled by touch");
+                app_state = STATE_IDLE;
+                echo_ui_set_state(STATE_IDLE);
+                break;
+            }
+
             if (err == ESP_OK && transcript[0]) {
                 ESP_LOGI(TAG, "Transcript: %s", transcript);
-                lv_label_set_text(lbl_info, transcript);
+                strncpy(last_transcript, transcript, sizeof(last_transcript) - 1);
+                last_transcript[sizeof(last_transcript) - 1] = '\0';
 
                 if (openclaw_get_state() != OPENCLAW_STATE_CONNECTED) {
                     ESP_LOGW(TAG, "OpenClaw not connected, skipping chat");
-                    update_ui_state("OC Disconnected", 0xFF4400);
-                    lv_label_set_text(lbl_response, "OpenClaw not available");
+                    echo_ui_set_error("OC not connected");
                     app_state = STATE_IDLE;
-                    vTaskDelay(pdMS_TO_TICKS(2000));
-                    update_ui_state("Ready", 0x00FF00);
-                    lv_label_set_text(lbl_response, "Say \"Hey Jarvis\" or press BOOT");
+                    echo_ui_set_state(STATE_IDLE);
                 } else {
                     app_state = STATE_CHATTING;
                 }
             } else {
                 ESP_LOGW(TAG, "STT failed or empty: %s", esp_err_to_name(err));
-                update_ui_state("STT Failed", 0xFF4400);
-                lv_label_set_text(lbl_info, err == ESP_ERR_NOT_FOUND ? "No speech detected" : esp_err_to_name(err));
+                echo_ui_set_error(err == ESP_ERR_NOT_FOUND ? "No speech detected" : "STT Failed");
                 app_state = STATE_IDLE;
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                update_ui_state("Ready", 0x00FF00);
-                lv_label_set_text(lbl_response, "Say \"Hey Jarvis\" or press BOOT");
+                echo_ui_set_state(STATE_IDLE);
             }
             break;
         }
 
         case STATE_CHATTING: {
-            update_ui_state("Thinking...", 0x00AAFF);
+            echo_ui_set_state(STATE_CHATTING);
+            echo_ui_set_transcript(last_transcript);
             hal.display()->lvgl_timer_handler();
 
-            const char *transcript = lv_label_get_text(lbl_info);
             oc_response_ready = false;
             bool chat_sent = false;
             int send_attempts = 0;
@@ -810,7 +898,7 @@ static void app_task(void *arg)
                     break;
                 }
 
-                esp_err_t err = openclaw_chat_send(transcript, oc_chat_callback);
+                esp_err_t err = openclaw_chat_send(last_transcript, oc_chat_callback);
                 send_attempts++;
                 if (err != ESP_OK) {
                     ESP_LOGE(TAG, "Chat send failed: %s (attempt %d)", esp_err_to_name(err), send_attempts);
@@ -826,6 +914,15 @@ static void app_task(void *arg)
                     bits = xEventGroupWaitBits(app_events, EVT_CHAT_DONE,
                                                pdTRUE, pdFALSE, pdMS_TO_TICKS(100));
                     if (bits & EVT_CHAT_DONE) break;
+
+                    /* Touch cancels chat */
+                    if (hal.display()->is_touched()) {
+                        ESP_LOGI(TAG, "Chat cancelled by touch");
+                        openclaw_chat_cancel();
+                        app_state = STATE_IDLE;
+                        echo_ui_set_state(STATE_IDLE);
+                        break;
+                    }
 
                     /* If connection dropped mid-chat, retry on reconnect */
                     if (openclaw_get_state() == OPENCLAW_STATE_DISCONNECTED ||
@@ -847,23 +944,23 @@ static void app_task(void *arg)
             }
 
             if (!oc_response_ready) {
+                if (app_state == STATE_IDLE) {
+                    break;  /* Already cancelled by touch */
+                }
                 ESP_LOGW(TAG, "Chat response timeout after %d attempts", send_attempts);
-                update_ui_state("Timeout", 0xFF4400);
+                openclaw_chat_cancel();  /* Clear stale callback + reset OC state */
+                echo_ui_set_error("Chat timeout");
                 app_state = STATE_IDLE;
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                update_ui_state("Ready", 0x00FF00);
-                lv_label_set_text(lbl_response, "Say \"Hey Jarvis\" or press BOOT");
+                echo_ui_set_state(STATE_IDLE);
                 break;
             }
 
-            lv_label_set_text(lbl_response, oc_response);
             ESP_LOGI(TAG, "Response: %.200s", oc_response);
 
             if (oc_response[0] == '\0') {
                 ESP_LOGW(TAG, "Empty response from OpenClaw, skipping TTS");
                 app_state = STATE_IDLE;
-                update_ui_state("Ready", 0x00FF00);
-                lv_label_set_text(lbl_response, "Say \"Hey Jarvis\" or press BOOT");
+                echo_ui_set_state(STATE_IDLE);
                 break;
             }
 
@@ -872,7 +969,8 @@ static void app_task(void *arg)
         }
 
         case STATE_SPEAKING: {
-            update_ui_state("Speaking...", 0x00FF00);
+            echo_ui_set_state(STATE_SPEAKING);
+            echo_ui_set_response(oc_response);
             hal.display()->lvgl_timer_handler();
 
             /* Disable wake detection during playback to prevent false triggers */
@@ -880,8 +978,9 @@ static void app_task(void *arg)
 
             gpio_set_level((gpio_num_t)PA_EN_IO, 1);
 
+            tts_cancel = false;
             esp_err_t err = tts_speak(oc_response, SAMPLE_RATE);
-            if (err != ESP_OK) {
+            if (err != ESP_OK && !tts_cancel) {
                 ESP_LOGW(TAG, "TTS failed: %s", esp_err_to_name(err));
             }
 
@@ -890,9 +989,22 @@ static void app_task(void *arg)
             /* Re-enable wake detection */
             micro_wake_enable(true);
 
-            app_state = STATE_IDLE;
-            update_ui_state("Ready", 0x00FF00);
-            lv_label_set_text(lbl_response, "Say \"Hey Jarvis\" or press BOOT");
+            if (tts_cancel) {
+                /* Touch cancelled playback — go straight to idle */
+                ESP_LOGI(TAG, "Playback cancelled, returning to idle");
+                tts_cancel = false;
+                continue_conversation = false;
+                app_state = STATE_IDLE;
+                echo_ui_set_state(STATE_IDLE);
+            } else {
+                /* Continue conversation — go back to recording instead of idle.
+                 * The recording loop will wait up to 2.5s for follow-up speech.
+                 * If no speech, it falls through to idle. */
+                ESP_LOGI(TAG, "Response complete, listening for follow-up...");
+                continue_conversation = true;
+                app_state = STATE_IDLE;
+                echo_ui_set_state(STATE_IDLE);
+            }
             break;
         }
 
@@ -907,6 +1019,10 @@ static void app_task(void *arg)
         }
 
         if (app_state == STATE_IDLE) {
+            /* Turn off display when idle (Alexa-style dark standby) */
+            if (hal.display()->get_backlight() > 0) {
+                hal.display()->set_backlight(0);
+            }
             vTaskDelay(pdMS_TO_TICKS(20));
         }
     }

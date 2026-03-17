@@ -132,7 +132,6 @@ static void send_connect(void)
     cJSON *scopes = cJSON_AddArrayToObject(params, "scopes");
     cJSON_AddItemToArray(scopes, cJSON_CreateString("operator.read"));
     cJSON_AddItemToArray(scopes, cJSON_CreateString("operator.write"));
-    cJSON_AddItemToArray(scopes, cJSON_CreateString("operator.admin"));
 
     if (strlen(s_oc.token) > 0) {
         cJSON *auth = cJSON_AddObjectToObject(params, "auth");
@@ -145,10 +144,21 @@ static void send_connect(void)
         gettimeofday(&tv, NULL);
         int64_t epoch_ms = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 
+        /* Manual int64→string (nano-printf doesn't support %lld on ESP32) */
+        char epoch_str[24];
+        {
+            uint64_t val = (uint64_t)epoch_ms;
+            char *p = epoch_str + sizeof(epoch_str) - 1;
+            *p = '\0';
+            if (val == 0) { *--p = '0'; }
+            while (val > 0) { *--p = '0' + (char)(val % 10); val /= 10; }
+            memmove(epoch_str, p, strlen(p) + 1);
+        }
+
         char auth_payload[512];
         snprintf(auth_payload, sizeof(auth_payload),
-                 "v2|%s|gateway-client|cli|operator|operator.read,operator.write,operator.admin|%" PRId64 "|%s|%s",
-                 s_oc.device_id, epoch_ms, s_oc.token, s_oc.nonce);
+                 "v2|%s|gateway-client|cli|operator|operator.read,operator.write|%s|%s|%s",
+                 s_oc.device_id, epoch_str, s_oc.token, s_oc.nonce);
 
         uint8_t signature[64];
         ed25519_sign(signature, (const uint8_t *)auth_payload, strlen(auth_payload),
@@ -183,7 +193,7 @@ static void send_connect(void)
 
 static void handle_message(const char *data, int len)
 {
-    ESP_LOGD(TAG, "WS msg (%d bytes): %.200s%s", len, data, len > 200 ? "..." : "");
+    ESP_LOGD(TAG, "WS msg (%d bytes): %.300s%s", len, data, len > 300 ? "..." : "");
 
     cJSON *root = cJSON_ParseWithLength(data, len);
     if (!root) {
@@ -293,9 +303,24 @@ static void handle_message(const char *data, int len)
         cJSON *error = cJSON_GetObjectItem(root, "error");
         if (error) {
             const char *msg = cJSON_GetStringValue(cJSON_GetObjectItem(error, "message"));
-            ESP_LOGE(TAG, "Request error: %s", msg ? msg : "unknown");
+            const char *method = cJSON_GetStringValue(cJSON_GetObjectItem(root, "method"));
+            ESP_LOGE(TAG, "Request error (%s): %s", method ? method : "?", msg ? msg : "unknown");
             if (s_oc.state == OPENCLAW_STATE_AUTHENTICATING) {
+                /* Log full error for pairing diagnostics */
+                const char *code = cJSON_GetStringValue(cJSON_GetObjectItem(error, "code"));
+                cJSON *edata = cJSON_GetObjectItem(error, "data");
+                if (code) ESP_LOGE(TAG, "Auth error code: %s", code);
+                if (edata) {
+                    const char *rid = cJSON_GetStringValue(cJSON_GetObjectItem(edata, "requestId"));
+                    if (rid) ESP_LOGE(TAG, "Pairing requestId: %s (approve in OpenClaw UI or CLI)", rid);
+                }
                 set_state(OPENCLAW_STATE_ERROR);
+            } else if (s_oc.state == OPENCLAW_STATE_CHAT_SENDING ||
+                       s_oc.state == OPENCLAW_STATE_CHAT_THINKING) {
+                /* Chat request rejected by server */
+                if (s_oc.chat_cb) s_oc.chat_cb(msg ? msg : "Error", true);
+                s_oc.chat_cb = NULL;
+                set_state(OPENCLAW_STATE_CONNECTED);
             }
         } else {
             /* Success response — if authenticating, we're now connected */
@@ -306,6 +331,26 @@ static void handle_message(const char *data, int len)
                     if (server) {
                         const char *ver = cJSON_GetStringValue(cJSON_GetObjectItem(server, "version"));
                         if (ver) ESP_LOGI(TAG, "Server version: %s", ver);
+                    }
+                    /* Log granted scopes */
+                    cJSON *auth = cJSON_GetObjectItem(payload, "auth");
+                    if (auth) {
+                        cJSON *granted = cJSON_GetObjectItem(auth, "scopes");
+                        if (granted && cJSON_IsArray(granted)) {
+                            char scope_str[256] = "";
+                            size_t spos = 0;
+                            cJSON *s;
+                            cJSON_ArrayForEach(s, granted) {
+                                const char *sv = cJSON_GetStringValue(s);
+                                if (sv && spos < sizeof(scope_str) - 1) {
+                                    if (spos > 0) scope_str[spos++] = ',';
+                                    spos += snprintf(scope_str + spos, sizeof(scope_str) - spos, "%s", sv);
+                                }
+                            }
+                            ESP_LOGI(TAG, "Granted scopes: %s", scope_str);
+                        }
+                        const char *dt = cJSON_GetStringValue(cJSON_GetObjectItem(auth, "deviceToken"));
+                        if (dt) ESP_LOGI(TAG, "Device token received (pairing OK)");
                     }
                 }
                 set_state(OPENCLAW_STATE_CONNECTED);
@@ -515,13 +560,19 @@ esp_err_t openclaw_chat_send(const char *message, openclaw_chat_cb_t response_cb
     cJSON_AddStringToObject(root, "method", "chat.send");
 
     cJSON *params = cJSON_AddObjectToObject(root, "params");
-    cJSON_AddStringToObject(params, "sessionKey", "default");
+
+    /* Unique session key per chat to avoid server-side session state issues
+     * (stuck runs on "default" session block subsequent chats) */
+    char session_key[32];
+    uint32_t ts_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    snprintf(session_key, sizeof(session_key), "echo-%" PRIu32, ts_ms);
+    cJSON_AddStringToObject(params, "sessionKey", session_key);
     cJSON_AddStringToObject(params, "message", message);
 
     /* Idempotency key */
     char idem_key[32];
-    snprintf(idem_key, sizeof(idem_key), "echo-%" PRIu64 "-%" PRIu32,
-             (uint64_t)(esp_timer_get_time() / 1000), s_oc.msg_id);
+    snprintf(idem_key, sizeof(idem_key), "echo-%" PRIu32 "-%" PRIu32,
+             ts_ms, s_oc.msg_id);
     cJSON_AddStringToObject(params, "idempotencyKey", idem_key);
 
     char *json_str = cJSON_PrintUnformatted(root);
@@ -545,6 +596,17 @@ esp_err_t openclaw_chat_send(const char *message, openclaw_chat_cb_t response_cb
     set_state(OPENCLAW_STATE_CHAT_THINKING);
     ESP_LOGI(TAG, "Chat sent: %.80s%s", message, strlen(message) > 80 ? "..." : "");
     return ESP_OK;
+}
+
+void openclaw_chat_cancel(void)
+{
+    if (s_oc.state == OPENCLAW_STATE_CHAT_SENDING ||
+        s_oc.state == OPENCLAW_STATE_CHAT_THINKING ||
+        s_oc.state == OPENCLAW_STATE_CHAT_STREAMING) {
+        ESP_LOGW(TAG, "Chat cancelled (was state %d)", s_oc.state);
+        s_oc.chat_cb = NULL;
+        set_state(OPENCLAW_STATE_CONNECTED);
+    }
 }
 
 const char *openclaw_get_last_response(void)
