@@ -4,7 +4,7 @@
  *
  * Runs on Core 0. Reads I2S TDM mic data, extracts MIC1 mono,
  * downsamples 24kHz→16kHz, computes mel spectrogram features via
- * the TFLite microfrontend, and feeds them to hey_jarvis.tflite
+ * the TFLite microfrontend, and feeds them to hey_snorri.tflite
  * and vad.tflite models for wake word and voice activity detection.
  */
 
@@ -32,15 +32,15 @@ extern "C" {
 static const char *TAG = "micro_wake";
 
 /* ── Model data (embedded via EMBED_FILES) ── */
-extern const uint8_t hey_jarvis_tflite_start[] asm("_binary_hey_jarvis_tflite_start");
-extern const uint8_t hey_jarvis_tflite_end[]   asm("_binary_hey_jarvis_tflite_end");
+extern const uint8_t hey_snorri_tflite_start[] asm("_binary_hey_snorri_tflite_start");
+extern const uint8_t hey_snorri_tflite_end[]   asm("_binary_hey_snorri_tflite_end");
 extern const uint8_t vad_tflite_start[]        asm("_binary_vad_tflite_start");
 extern const uint8_t vad_tflite_end[]          asm("_binary_vad_tflite_end");
 
 /* ── Model config (from model JSON files) ── */
 #define WAKE_SLIDING_WINDOW      10
 #define WAKE_TENSOR_ARENA_SIZE   46000
-/* probability_cutoff 0.97 → in uint8 scale: 0.97 * 255 ≈ 247 */
+/* probability_cutoff 0.97 -> in uint8 scale: 0.97 * 255 ≈ 247 */
 #define WAKE_CUTOFF_U8           247
 
 #define VAD_SLIDING_WINDOW       5
@@ -286,7 +286,7 @@ static void wake_task(void *arg)
     (void)arg;
 
     /* Load TFLite models */
-    const tflite::Model *wake_model = tflite::GetModel(hey_jarvis_tflite_start);
+    const tflite::Model *wake_model = tflite::GetModel(hey_snorri_tflite_start);
     const tflite::Model *vad_model = tflite::GetModel(vad_tflite_start);
 
     if (!wake_model || !vad_model) {
@@ -296,7 +296,7 @@ static void wake_task(void *arg)
     }
 
     ESP_LOGI(TAG, "Models loaded: wake=%u bytes, vad=%u bytes",
-             (unsigned)(hey_jarvis_tflite_end - hey_jarvis_tflite_start),
+             (unsigned)(hey_snorri_tflite_end - hey_snorri_tflite_start),
              (unsigned)(vad_tflite_end - vad_tflite_start));
 
     /* Create op resolver — microWakeWord v2 streaming models need these 20 ops */

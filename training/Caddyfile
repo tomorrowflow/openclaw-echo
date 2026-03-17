@@ -1,0 +1,10 @@
+{
+	local_certs
+}
+
+:443 {
+	tls internal {
+		on_demand
+	}
+	reverse_proxy recorder:8888
+}

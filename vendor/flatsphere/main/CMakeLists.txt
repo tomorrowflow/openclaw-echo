@@ -17,7 +17,7 @@ idf_component_register(SRCS "main.cpp" "micro_wake.cpp" "stt_client.c" "tts_clie
         esp_http_client esp_websocket_client mbedtls esp-tflite-micro
     PRIV_REQUIRES ed25519_lib minimp3 microfrontend microlink
     EMBED_FILES assets/coin16.wav assets/error.wav assets/usb_connected.wav assets/usb_disconnected.wav
-        assets/hey_jarvis.tflite assets/vad.tflite
+        assets/hey_snorri.tflite assets/vad.tflite
 )
 
 
