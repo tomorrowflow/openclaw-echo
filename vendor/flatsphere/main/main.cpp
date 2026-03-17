@@ -856,7 +856,22 @@ static void app_task(void *arg)
                     app_state = STATE_IDLE;
                     echo_ui_set_state(STATE_IDLE);
                 } else {
-                    app_state = STATE_TRANSCRIBING;
+                    /* Check audio energy — skip STT if recording is mostly silence.
+                     * Prevents Whisper hallucinations on ambient noise. */
+                    int64_t energy_sum = 0;
+                    for (size_t i = 0; i < record_samples; i += 16) {
+                        int32_t s = record_buf[i];
+                        energy_sum += s * s;
+                    }
+                    uint32_t rms = (uint32_t)sqrtf((float)energy_sum / (float)(record_samples / 16));
+                    ESP_LOGI(TAG, "Audio RMS energy: %lu", (unsigned long)rms);
+                    if (rms < 200) {
+                        ESP_LOGW(TAG, "Audio too quiet (RMS=%lu), skipping STT", (unsigned long)rms);
+                        app_state = STATE_IDLE;
+                        echo_ui_set_state(STATE_IDLE);
+                    } else {
+                        app_state = STATE_TRANSCRIBING;
+                    }
                 }
             }
             break;
