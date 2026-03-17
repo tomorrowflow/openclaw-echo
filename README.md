@@ -119,6 +119,60 @@ vendor/flatsphere/
 | HeyClawy components | MIT (ported) |
 | microWakeWord models | esphome/micro-wake-word-models v2 |
 
+## Custom Wake Word Training
+
+Train a custom wake word (e.g., "Hey Snorri") using [TaterTotterson's microWakeWord NVIDIA Docker trainer](https://github.com/TaterTotterson/microWakeWord-Trainer-Nvidia-Docker). Requires a machine with an NVIDIA GPU.
+
+### Setup (on GPU machine)
+
+```bash
+git clone https://github.com/tomorrowflow/openclaw-echo.git
+cd openclaw-echo
+./training/setup.sh
+```
+
+### Train
+
+```bash
+cd training/microWakeWord-Trainer-Nvidia-Docker
+docker run --rm -it --gpus all -p 8888:8888 -v $(pwd)/data:/data microwakeword-trainer
+```
+
+Open http://localhost:8888 in your browser:
+
+1. Enter your wake word (e.g., `hey_snorri`)
+2. Click **Test TTS** — if pronunciation is off, try `hey_snorree` or `hey_snorrey`
+3. (Optional) Record your voice — set speakers/takes, speak naturally. Improves real-world accuracy.
+4. Click **Train** — first run downloads ~5GB of datasets (cached), then trains (~30 min on a 3090)
+
+Output (`.tflite` + `.json`) appears in `training/microWakeWord-Trainer-Nvidia-Docker/data/output/`.
+
+### Flash to device
+
+Copy the trained model and manifest, then run the swap script:
+
+```bash
+cp data/output/<timestamp>/hey_snorri.tflite ../../training/models/
+cp data/output/<timestamp>/hey_snorri.json ../../training/models/
+
+# From project root:
+./training/swap_model.sh training/models/hey_snorri.tflite training/models/hey_snorri.json
+```
+
+This updates `CMakeLists.txt`, `micro_wake.cpp` (asm symbols + config) automatically. Then build and flash:
+
+```bash
+source ~/esp/esp-idf/export.sh
+cd vendor/flatsphere
+idf.py build && idf.py -p /dev/cu.usbmodem1101 flash monitor
+```
+
+### Tuning (no retraining needed)
+
+Edit `vendor/flatsphere/main/micro_wake.cpp`:
+- **WAKE_CUTOFF_U8** — lower (e.g., 230) = more sensitive, higher (e.g., 250) = fewer false positives
+- **WAKE_SLIDING_WINDOW** — larger = slower detection but fewer false triggers
+
 ## Credits
 
 - [flatsphere](https://github.com/d4rkmen/flatsphere) by d4rkmen — HAL for Waveshare 1.85C (Apache 2.0)
