@@ -44,8 +44,14 @@ esp_err_t openclaw_connect(void);
 esp_err_t openclaw_disconnect(void);
 openclaw_state_t openclaw_get_state(void);
 
-/* Send a text chat message and receive streaming response via callback */
-esp_err_t openclaw_chat_send(const char *message, openclaw_chat_cb_t response_cb);
+/* Send a text chat message and receive streaming response via callback.
+ * session_key: if non-NULL, reuses an existing conversation session;
+ *              if NULL, generates a unique session key (new conversation). */
+esp_err_t openclaw_chat_send(const char *message, const char *session_key, openclaw_chat_cb_t response_cb);
+
+/* Get the session key used by the last chat.send (valid after openclaw_chat_send).
+ * Caller should copy if needed — pointer is to internal static buffer. */
+const char *openclaw_get_session_key(void);
 
 /* Cancel a pending chat (clears callback, resets state to CONNECTED) */
 void openclaw_chat_cancel(void);

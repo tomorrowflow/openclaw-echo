@@ -51,6 +51,7 @@ esp_err_t Display::init()
 
     // Initialize in sequence (I2C already initialized by HAL)
     ESP_ERROR_CHECK(init_lcd());
+    ESP_ERROR_CHECK(set_rotation(2));  // 180° — USB port away from user
     ESP_ERROR_CHECK(init_backlight());
     ESP_ERROR_CHECK(init_touch());
     ESP_ERROR_CHECK(init_lvgl());
@@ -328,12 +329,23 @@ uint32_t Display::lvgl_get_tick_cb()
 
 esp_err_t Display::init_lvgl()
 {
-    ESP_LOGI(TAG, "Initializing LVGL (use: %s)...", DisplayConfig::LVGL::USE_PSRAM ? "PSRAM" : "RAM");
+    ESP_LOGI(TAG, "Initializing LVGL (buf=%u bytes x2, internal DMA)...",
+             DisplayConfig::LVGL::BUFFER_SIZE);
 
     // Initialize LVGL
     lv_init();
-    _lv_buf1 = heap_caps_aligned_alloc(32, DisplayConfig::LVGL::BUFFER_SIZE, DisplayConfig::LVGL::USE_PSRAM ? MALLOC_CAP_SPIRAM : MALLOC_CAP_8BIT);
-    _lv_buf2 = heap_caps_aligned_alloc(32, DisplayConfig::LVGL::BUFFER_SIZE, DisplayConfig::LVGL::USE_PSRAM ? MALLOC_CAP_SPIRAM : MALLOC_CAP_8BIT);
+    // Allocate LVGL draw buffers from internal DMA-capable RAM.
+    // PSRAM buffers cause esp_ptr_dma_capable() to return false in the SPI
+    // master driver, which then runtime-allocates bounce buffers from internal
+    // RAM via heap_caps_aligned_alloc(MALLOC_CAP_DMA).  When internal RAM is
+    // low (WiFi + MicroLink + TLS), those allocations fail intermittently,
+    // producing "spi transmit (queue) color failed" errors.  By placing the
+    // LVGL buffers in internal DMA RAM directly, the SPI driver DMAs from
+    // them with zero runtime allocation.
+    _lv_buf1 = heap_caps_aligned_alloc(32, DisplayConfig::LVGL::BUFFER_SIZE,
+                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    _lv_buf2 = heap_caps_aligned_alloc(32, DisplayConfig::LVGL::BUFFER_SIZE,
+                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (!_lv_buf1 || !_lv_buf2)
     {
         ESP_LOGE(TAG, "Failed to allocate LVGL buffers");

@@ -348,7 +348,7 @@ void microlink_state_machine(microlink_t *ml) {
                     static uint64_t last_derp_retry = 0;
                     if (now_ms - last_derp_retry >= 10000) {  // Retry every 10s
                         ESP_LOGW(TAG, "DERP disconnected, attempting reconnect...");
-                        microlink_derp_connect(ml);
+                        microlink_derp_reconnect(ml);
                         last_derp_retry = now_ms;
                     }
                 }

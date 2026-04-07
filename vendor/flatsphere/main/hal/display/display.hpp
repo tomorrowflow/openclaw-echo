@@ -87,8 +87,8 @@ namespace DisplayConfig
         constexpr uint16_t MAX_X = LCD::WIDTH - 1;
         constexpr uint16_t MAX_Y = LCD::HEIGHT - 1;
         constexpr bool SWAP_XY = false;
-        constexpr bool MIRROR_X = false;
-        constexpr bool MIRROR_Y = false;
+        constexpr bool MIRROR_X = true;
+        constexpr bool MIRROR_Y = true;
     }
 
     // ========================================================================
@@ -96,8 +96,10 @@ namespace DisplayConfig
     // ========================================================================
     namespace LVGL
     {
-        // Buffer size (1/20 of screen for double buffering)
-        constexpr uint32_t BUFFER_SIZE = (LCD::WIDTH * LCD::HEIGHT * (LCD::COLOR_BITS >> 3));
+        // Buffer size: ~10 rows for double buffering (partial render mode).
+        // Allocated from internal DMA-capable RAM so the SPI driver can DMA
+        // directly — no runtime bounce-buffer allocation from scarce internal RAM.
+        constexpr uint32_t BUFFER_SIZE = LCD::WIDTH * 10 * (LCD::COLOR_BITS >> 3); // 7200 bytes
         constexpr uint8_t TICK_PERIOD_MS = 1;
 
         // Memory allocation

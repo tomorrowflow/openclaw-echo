@@ -994,6 +994,15 @@ esp_err_t microlink_derp_receive(microlink_t *ml) {
         xSemaphoreGive(derp_tls_mutex);
         ESP_LOGE(TAG, "DERP connection lost (err=%d)", err);
         ml->derp.connected = false;
+        // Free SSL resources immediately so stale PSRAM pointers don't
+        // cause heap corruption when mbedtls_ssl_setup runs on reconnect.
+        mbedtls_ssl_free(&ml->derp.ssl);
+        mbedtls_ssl_config_free(&ml->derp.ssl_conf);
+        mbedtls_net_free(&derp_server_fd);
+        ml->derp.sockfd = -1;
+        mbedtls_net_init(&derp_server_fd);
+        mbedtls_ssl_init(&ml->derp.ssl);
+        mbedtls_ssl_config_init(&ml->derp.ssl_conf);
         return ESP_FAIL;
     }
 
@@ -1002,6 +1011,13 @@ esp_err_t microlink_derp_receive(microlink_t *ml) {
         xSemaphoreGive(derp_tls_mutex);
         ESP_LOGE(TAG, "Frame too large: %lu", len);
         ml->derp.connected = false;
+        mbedtls_ssl_free(&ml->derp.ssl);
+        mbedtls_ssl_config_free(&ml->derp.ssl_conf);
+        mbedtls_net_free(&derp_server_fd);
+        ml->derp.sockfd = -1;
+        mbedtls_net_init(&derp_server_fd);
+        mbedtls_ssl_init(&ml->derp.ssl);
+        mbedtls_ssl_config_init(&ml->derp.ssl_conf);
         return ESP_FAIL;
     }
 

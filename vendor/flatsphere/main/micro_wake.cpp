@@ -84,7 +84,7 @@ static int wake_prob_idx = 0;
 static uint8_t vad_probs[VAD_SLIDING_WINDOW];
 static int vad_prob_idx = 0;
 static int wake_cooldown = 0;
-#define WAKE_COOLDOWN_WINDOWS 20
+#define WAKE_COOLDOWN_WINDOWS 150  /* ~3s at 20ms/invoke — suppresses residual model activation */
 
 /* Microfrontend state */
 static struct FrontendState s_frontend;
@@ -213,10 +213,10 @@ esp_err_t micro_wake_start(i2s_chan_handle_t rx_chan)
         return ESP_FAIL;
     }
 
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        wake_task, "wake_word", 8192, nullptr, 5, &wake_task_handle, 0);
+    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
+        wake_task, "wake_word", 8192, nullptr, 5, &wake_task_handle, 0, MALLOC_CAP_SPIRAM);
     if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create wake word task");
+        ESP_LOGE(TAG, "Failed to create wake word task (internal RAM exhausted?)");
         return ESP_FAIL;
     }
 
@@ -274,7 +274,7 @@ void micro_wake_enable(bool enable)
     if (enable) {
         memset(wake_probs, 0, sizeof(wake_probs));
         wake_prob_idx = 0;
-        wake_cooldown = 0;
+        wake_cooldown = WAKE_COOLDOWN_WINDOWS;  /* Suppress re-triggers on stale audio */
     }
 }
 
@@ -410,7 +410,7 @@ static void wake_task(void *arg)
             s_rec_pos += to_copy;
         }
 
-        if (!s_enabled) continue;
+        if (!s_enabled && !s_recording) continue;
 
         /* Feed samples to frontend one step at a time */
         size_t mono_offset = 0;
@@ -443,7 +443,7 @@ static void wake_task(void *arg)
 
             if (wake_stride_pos >= wake_stride) {
                 wake_stride_pos = 0;
-                if (wake_interp.Invoke() == kTfLiteOk) {
+                if (s_enabled && wake_interp.Invoke() == kTfLiteOk) {
                     TfLiteTensor *out = wake_interp.output(0);
                     uint8_t prob = out->data.uint8[0];
                     invoke_count++;

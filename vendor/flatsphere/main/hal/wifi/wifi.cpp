@@ -222,6 +222,8 @@ namespace HAL
 
         strncpy((char*)wifi_config.sta.ssid, _wifi_settings.ssid.c_str(), sizeof(wifi_config.sta.ssid) - 1);
         strncpy((char*)wifi_config.sta.password, _wifi_settings.password.c_str(), sizeof(wifi_config.sta.password) - 1);
+        wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+        wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
 
         err = esp_wifi_set_mode(WIFI_MODE_STA);
         if (err != ESP_OK)

@@ -93,6 +93,8 @@ static struct {
     char *frag_buf;
     size_t frag_len;
     size_t frag_total;
+    /* Session key for conversation continuity */
+    char last_session_key[32];
 } s_oc;
 
 static void set_state(openclaw_state_t st)
@@ -546,7 +548,7 @@ openclaw_state_t openclaw_get_state(void)
     return s_oc.state;
 }
 
-esp_err_t openclaw_chat_send(const char *message, openclaw_chat_cb_t response_cb)
+esp_err_t openclaw_chat_send(const char *message, const char *session_key, openclaw_chat_cb_t response_cb)
 {
     if (s_oc.state != OPENCLAW_STATE_CONNECTED) {
         ESP_LOGE(TAG, "Not connected to OpenClaw (state=%d)", s_oc.state);
@@ -565,18 +567,23 @@ esp_err_t openclaw_chat_send(const char *message, openclaw_chat_cb_t response_cb
 
     cJSON *params = cJSON_AddObjectToObject(root, "params");
 
-    /* Unique session key per chat to avoid server-side session state issues
-     * (stuck runs on "default" session block subsequent chats) */
-    char session_key[32];
-    uint32_t ts_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    snprintf(session_key, sizeof(session_key), "echo-%" PRIu32, ts_ms);
-    cJSON_AddStringToObject(params, "sessionKey", session_key);
+    /* Use caller-provided session key for conversation continuity,
+     * or generate a unique one for a new conversation */
+    if (session_key && session_key[0] != '\0') {
+        strncpy(s_oc.last_session_key, session_key, sizeof(s_oc.last_session_key) - 1);
+        s_oc.last_session_key[sizeof(s_oc.last_session_key) - 1] = '\0';
+    } else {
+        uint32_t ts_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        snprintf(s_oc.last_session_key, sizeof(s_oc.last_session_key), "echo-%" PRIu32, ts_ms);
+    }
+    cJSON_AddStringToObject(params, "sessionKey", s_oc.last_session_key);
     cJSON_AddStringToObject(params, "message", message);
 
     /* Idempotency key */
     char idem_key[32];
+    uint32_t idem_ts = (uint32_t)(esp_timer_get_time() / 1000);
     snprintf(idem_key, sizeof(idem_key), "echo-%" PRIu32 "-%" PRIu32,
-             ts_ms, s_oc.msg_id);
+             idem_ts, s_oc.msg_id);
     cJSON_AddStringToObject(params, "idempotencyKey", idem_key);
 
     char *json_str = cJSON_PrintUnformatted(root);
@@ -627,4 +634,9 @@ uint32_t openclaw_get_thinking_time_ms(void)
 const char *openclaw_get_device_id(void)
 {
     return s_oc.device_id;
+}
+
+const char *openclaw_get_session_key(void)
+{
+    return s_oc.last_session_key;
 }

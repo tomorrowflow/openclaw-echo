@@ -10,7 +10,7 @@ file(GLOB_RECURSE UI_SRCS
     ui/*.c
 )
 
-idf_component_register(SRCS "main.cpp" "micro_wake.cpp" "stt_client.c" "tts_client.c" "openclaw_client.c"
+idf_component_register(SRCS "main.cpp" "echo_ui.cpp" "micro_wake.cpp" "stt_client.c" "tts_client.c" "openclaw_client.c"
     ${HAL_SRCS} ${SETTINGS_SRCS} ${UI_SRCS}
     INCLUDE_DIRS "." "include" "ui" "hal" "settings"
     REQUIRES spi_flash fatfs esp_wifi json esp_lcd driver nvs_flash esp_timer esp_adc usb usb_host_msc
