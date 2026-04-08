@@ -38,7 +38,7 @@ extern const uint8_t vad_tflite_start[]        asm("_binary_vad_tflite_start");
 extern const uint8_t vad_tflite_end[]          asm("_binary_vad_tflite_end");
 
 /* ── Model config (from model JSON files) ── */
-#define WAKE_SLIDING_WINDOW      10
+#define WAKE_SLIDING_WINDOW      15
 #define WAKE_TENSOR_ARENA_SIZE   46000
 /* probability_cutoff 0.97 -> in uint8 scale: 0.97 * 255 ≈ 247 */
 #define WAKE_CUTOFF_U8           247
